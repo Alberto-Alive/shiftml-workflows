@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.4.0.dev0] - 2026-03-04
+## [0.4.0] - 2026-03-04
 - Implemented CPU multi-worker prediction execution via frame chunking and worker-local backend instances.
 - Preserved deterministic final output row ordering by `(source_file, frame, atom_i)` for multi-worker runs.
 - Extended `.magres` export to include lattice/cell lines and explicit PBC metadata comments (best-effort Soprano compatibility).
