@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.2.0] - Unreleased
+## [0.2.0] - 2026-03-03
 - Hardened cache/index scanning with streaming JSONL parsing, deterministic duplicate-key precedence, malformed trailing-line tolerance, and stale lookup-cache invalidation after writes.
 - Improved cache hit materialization so cached predictions are remapped to current frame metadata, including duplicate-key input handling.
 - Hardened validation policy handling so `--strict` maps to the same path as `--on-warning error`, while unsupported elements remain hard errors even with `--on-warning skip`.
