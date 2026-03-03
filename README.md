@@ -57,7 +57,7 @@ shiftmlwf cache-compact /scratch/$USER/shiftml-cache
 ## Outputs
 
 - `results.csv` or `results.parquet`
-- optional magres files (`--magres per-frame|single`)
+- optional magres files (`--magres per-frame|single`) with lattice/cell and PBC metadata
 - `run.json` with provenance, warnings, timings, and runtime metadata
 
 ### Stable schema columns
@@ -122,6 +122,7 @@ If you explicitly set `--property tensor|both`, it is honored.
 - `--device auto` resolves to `cuda` when available, otherwise `cpu`.
 - `--device cpu|cuda` is used as requested.
 - `device=cuda` with `workers>1` is coerced to `workers=1` unless `--force-multi-gpu` is set.
+- `device=cpu` with `workers>1` runs chunked multi-worker prediction and instantiates one backend per worker thread.
 - `run.json` runtime metadata records the resolved runtime device and worker count.
 
 ## Workflow integrations
