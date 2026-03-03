@@ -33,11 +33,17 @@ class PredictConfig:
     command_args: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
+        def _json_safe(value: Any) -> Any:
+            if isinstance(value, Path):
+                return str(value)
+            if isinstance(value, dict):
+                return {str(k): _json_safe(v) for k, v in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [_json_safe(v) for v in value]
+            return value
+
         data = asdict(self)
-        data["outdir"] = str(self.outdir)
-        data["cache_dir"] = str(self.cache_dir) if self.cache_dir is not None else None
-        data["config_path"] = str(self.config_path) if self.config_path is not None else None
-        return data
+        return _json_safe(data)
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -75,6 +81,23 @@ def _first_non_none(*values: Any) -> Any:
     return None
 
 
+def _coerce_bool(value: Any, *, field_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        if value in {0, 1}:
+            return bool(value)
+        raise ConfigError(f"{field_name} must be a boolean")
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+        raise ConfigError(f"{field_name} must be a boolean")
+    raise ConfigError(f"{field_name} must be a boolean")
+
+
 def build_predict_config(
     *,
     outdir: Path,
@@ -88,8 +111,8 @@ def build_predict_config(
     def resolve(key: str, default: Any) -> Any:
         return _first_non_none(cli_values.get(key), file_values.get(key), default)
 
-    on_warning = resolve("on_warning", "warn")
-    strict = bool(resolve("strict", False))
+    on_warning = str(resolve("on_warning", "warn")).strip().lower()
+    strict = _coerce_bool(resolve("strict", False), field_name="strict")
     if strict:
         on_warning = "error"
 
@@ -99,35 +122,40 @@ def build_predict_config(
         file_values.get("property"),
         None,
     )
+    if property_mode is not None:
+        property_mode = str(property_mode).strip().lower()
     output_format = _first_non_none(
         cli_values.get("output_format"),
         file_values.get("output_format"),
         file_values.get("format"),
         "auto",
     )
+    output_format = str(output_format).strip().lower()
     magres_mode = _first_non_none(
         cli_values.get("magres_mode"),
         file_values.get("magres_mode"),
         file_values.get("magres"),
         "none",
     )
+    magres_mode = str(magres_mode).strip().lower()
+    cache_dir_value = resolve("cache_dir", None)
 
     cfg = PredictConfig(
         outdir=outdir,
         frames=str(resolve("frames", ":")),
-        device=str(resolve("device", "auto")),
+        device=str(resolve("device", "auto")).strip().lower(),
         workers=int(resolve("workers", 1)),
         chunk_size=int(resolve("chunk_size", 200)),
         cache_chunk_max_mb=float(resolve("cache_chunk_max_mb", 100.0)),
-        committee=bool(resolve("committee", False)),
+        committee=_coerce_bool(resolve("committee", False), field_name="committee"),
         property_mode=property_mode,
-        output_format=str(output_format),
-        magres_mode=str(magres_mode),
-        cache_dir=Path(resolve("cache_dir", "")) if resolve("cache_dir", None) else None,
+        output_format=output_format,
+        magres_mode=magres_mode,
+        cache_dir=Path(cache_dir_value) if cache_dir_value else None,
         config_path=config_path,
-        dry_run=bool(resolve("dry_run", False)),
+        dry_run=_coerce_bool(resolve("dry_run", False), field_name="dry_run"),
         on_warning=on_warning,
-        force_multi_gpu=bool(resolve("force_multi_gpu", False)),
+        force_multi_gpu=_coerce_bool(resolve("force_multi_gpu", False), field_name="force_multi_gpu"),
         command_args={k: v for k, v in cli_values.items() if v is not None},
     )
     validate_predict_config(cfg)

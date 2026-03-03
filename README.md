@@ -74,11 +74,29 @@ Cache storage is chunked to avoid many tiny files:
 Cache index uses per-writer JSONL files:
 - `index_<hostname>-<pid>-<run_suffix>.jsonl`
 - malformed trailing lines are ignored safely
+- duplicate-key merge precedence is deterministic: latest by `(written_at_utc, writer_id, seq)`, then line order, then index path
+
+Cache lookups remap cached predictions onto the current frame metadata (`source_file`, `frame`, coordinates), so reused keys remain correct across files/runs.
 
 ## Committee uncertainty
 
 If `--committee` is set and `--property` is omitted, property resolves to `iso`.
 If you explicitly set `--property tensor|both`, it is honored.
+
+## Validation policy
+
+- `--on-warning warn`: keep warning-class frames and report warnings.
+- `--on-warning error`: fail immediately on warning-class issues.
+- `--on-warning skip`: skip only warning-class frames; if all are skipped, exits with validation error.
+- `--strict` is an alias for `--on-warning error` and uses the same validation codepath.
+- Unsupported elements are always hard validation errors (never skippable).
+
+## Runtime device selection
+
+- `--device auto` resolves to `cuda` when available, otherwise `cpu`.
+- `--device cpu|cuda` is used as requested.
+- `device=cuda` with `workers>1` is coerced to `workers=1` unless `--force-multi-gpu` is set.
+- `run.json` runtime metadata records the resolved runtime device and worker count.
 
 ## Limitations
 

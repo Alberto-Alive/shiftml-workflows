@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Iterator
 
 import json
 import os
@@ -53,13 +53,14 @@ class _IndexRecord:
     writer_id: str
     seq: int
     written_at_utc: str
+    written_at: datetime
     source_index_path: str
     source_line_no: int
 
     @property
     def rank(self) -> tuple[datetime, str, int, int, str]:
         return (
-            parse_rfc3339_utc(self.written_at_utc),
+            self.written_at,
             self.writer_id,
             self.seq,
             self.source_line_no,
@@ -97,6 +98,7 @@ class CacheStore:
         self._chunk_seq = 0
         self._manifest: dict[str, _IndexRecord] | None = None
         self._resolved_lookup_cache: dict[str, _IndexRecord | None] = {}
+        self._chunk_cache: dict[tuple[str, str], pd.DataFrame | None] = {}
 
     def _next_line_seq(self) -> int:
         self._line_seq += 1
@@ -112,47 +114,85 @@ class CacheStore:
             fh.flush()
             os.fsync(fh.fileno())
 
+    def _iter_index_records(self, index_path: Path) -> Iterator[_IndexRecord]:
+        try:
+            with index_path.open("r", encoding="utf-8") as fh:
+                for line_no, raw in enumerate(fh, start=1):
+                    if not raw.strip():
+                        continue
+                    try:
+                        payload = json.loads(raw)
+                    except json.JSONDecodeError:
+                        # Tolerate partially-written trailing lines.
+                        continue
+
+                    try:
+                        cache_key = str(payload["cache_key"])
+                        chunk_path = str(payload["chunk_path"])
+                        output_format = str(payload["output_format"])
+                        writer_id = str(payload["writer_id"])
+                        seq = int(payload["seq"])
+                        written_at_utc = str(payload["written_at_utc"])
+                        written_at = parse_rfc3339_utc(written_at_utc)
+                    except Exception:
+                        continue
+
+                    yield _IndexRecord(
+                        cache_key=cache_key,
+                        chunk_path=chunk_path,
+                        output_format=output_format,
+                        writer_id=writer_id,
+                        seq=seq,
+                        written_at_utc=written_at_utc,
+                        written_at=written_at,
+                        source_index_path=str(index_path),
+                        source_line_no=line_no,
+                    )
+        except OSError:
+            return
+
+    def _prefer_record(self, record: _IndexRecord, existing: _IndexRecord) -> bool:
+        record_pref = record.output_format == self.output_format
+        existing_pref = existing.output_format == self.output_format
+        if record_pref != existing_pref:
+            return record_pref
+        return record.rank > existing.rank
+
+    def _read_chunk(self, chunk_path: str, output_format: str) -> pd.DataFrame | None:
+        chunk_key = (chunk_path, output_format)
+        if chunk_key in self._chunk_cache:
+            return self._chunk_cache[chunk_key]
+
+        chunk_file = Path(chunk_path)
+        if not chunk_file.exists():
+            self._chunk_cache[chunk_key] = None
+            return None
+        try:
+            if output_format == "parquet":
+                chunk_df = pd.read_parquet(chunk_file)
+            else:
+                chunk_df = pd.read_csv(chunk_file)
+        except Exception:
+            self._chunk_cache[chunk_key] = None
+            return None
+
+        if "frame_cache_key" not in chunk_df.columns:
+            self._chunk_cache[chunk_key] = None
+            return None
+
+        self._chunk_cache[chunk_key] = chunk_df
+        return chunk_df
+
     def _load_manifest(self) -> dict[str, _IndexRecord]:
         manifest: dict[str, _IndexRecord] = {}
         for index_path in sorted(self.index_dir.glob("index_*.jsonl")):
-            try:
-                text = index_path.read_text(encoding="utf-8")
-            except OSError:
-                continue
-            for line_no, raw in enumerate(text.splitlines(), start=1):
-                if not raw.strip():
-                    continue
-                try:
-                    payload = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
-
-                try:
-                    cache_key = str(payload["cache_key"])
-                    chunk_path = str(payload["chunk_path"])
-                    output_format = str(payload["output_format"])
-                    writer_id = str(payload["writer_id"])
-                    seq = int(payload["seq"])
-                    written_at_utc = str(payload["written_at_utc"])
-                    parse_rfc3339_utc(written_at_utc)
-                except Exception:
-                    continue
-
-                record = _IndexRecord(
-                    cache_key=cache_key,
-                    chunk_path=chunk_path,
-                    output_format=output_format,
-                    writer_id=writer_id,
-                    seq=seq,
-                    written_at_utc=written_at_utc,
-                    source_index_path=str(index_path),
-                    source_line_no=line_no,
-                )
-                existing = manifest.get(cache_key)
-                if existing is None or record.rank > existing.rank:
-                    manifest[cache_key] = record
+            for record in self._iter_index_records(index_path):
+                existing = manifest.get(record.cache_key)
+                if existing is None or self._prefer_record(record, existing):
+                    manifest[record.cache_key] = record
 
         self._manifest = manifest
+        self._resolved_lookup_cache.clear()
         return manifest
 
     def _manifest_or_load(self) -> dict[str, _IndexRecord]:
@@ -161,17 +201,18 @@ class CacheStore:
         return self._manifest
 
     def lookup_many(self, keys: Iterable[str]) -> pd.DataFrame:
-        key_list = list(keys)
+        key_list = [str(key) for key in keys]
         if not key_list:
             return pd.DataFrame()
 
         manifest = self._manifest_or_load()
-        unresolved = [key for key in key_list if key not in self._resolved_lookup_cache]
+        unique_keys = list(dict.fromkeys(key_list))
+        unresolved = [key for key in unique_keys if key not in self._resolved_lookup_cache]
         for key in unresolved:
             self._resolved_lookup_cache[key] = manifest.get(key)
 
         by_chunk: dict[tuple[str, str], set[str]] = {}
-        for key in key_list:
+        for key in unique_keys:
             record = self._resolved_lookup_cache.get(key)
             if record is None:
                 continue
@@ -179,18 +220,8 @@ class CacheStore:
 
         parts: list[pd.DataFrame] = []
         for (chunk_path, output_format), wanted_keys in by_chunk.items():
-            chunk_file = Path(chunk_path)
-            if not chunk_file.exists():
-                continue
-            try:
-                if output_format == "parquet":
-                    chunk_df = pd.read_parquet(chunk_file)
-                else:
-                    chunk_df = pd.read_csv(chunk_file)
-            except Exception:
-                continue
-
-            if "frame_cache_key" not in chunk_df.columns:
+            chunk_df = self._read_chunk(chunk_path, output_format)
+            if chunk_df is None:
                 continue
             hit = chunk_df[chunk_df["frame_cache_key"].isin(wanted_keys)]
             if not hit.empty:
@@ -270,3 +301,4 @@ class CacheStore:
 
         # Manifest cache is stale after writes.
         self._manifest = None
+        self._resolved_lookup_cache.clear()

@@ -24,9 +24,22 @@ class ShiftML3Backend:
         self._model: Optional[Any] = None
 
     @staticmethod
-    def _normalize_device(device: str | None) -> str | None:
+    def _cuda_available() -> bool:
+        try:
+            import torch
+        except Exception:
+            return False
+        try:
+            return bool(torch.cuda.is_available())
+        except Exception:
+            return False
+
+    @classmethod
+    def _normalize_device(cls, device: str | None) -> str:
         if device in {None, "auto"}:
-            return None
+            return "cuda" if cls._cuda_available() else "cpu"
+        if device not in {"cpu", "cuda"}:
+            raise ValueError("device must be one of auto|cpu|cuda")
         return device
 
     def _model_instance(self) -> Any:

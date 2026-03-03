@@ -61,6 +61,16 @@ def collect_input_hashes(paths: Iterable[str]) -> list[dict[str, str]]:
     return out
 
 
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
 def build_run_record(
     *,
     command: str,
@@ -79,7 +89,7 @@ def build_run_record(
     timing: Timing,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    record = {
+    record: dict[str, Any] = {
         "tool_version": __version__,
         "schema_version": SCHEMA_VERSION,
         "git_commit": git_commit(),
@@ -117,7 +127,7 @@ def build_run_record(
     }
     if extra:
         record.update(extra)
-    return record
+    return _json_safe(record)
 
 
 def write_run_record(path: Path, record: dict[str, Any]) -> None:
