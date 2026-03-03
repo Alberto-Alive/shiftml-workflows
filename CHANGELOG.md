@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.3.0] - 2026-03-03
+- Added `shiftmlwf average` CLI for per-atom weighted/unweighted averaging across `results.csv|parquet` tables, with JSON/YAML frame-weight maps.
+- Added `shiftmlwf cache-compact` CLI and cache utilities to compact `index_*.jsonl` logs deterministically, keeping latest records per `(cache_key, output_format)`.
+- Added test coverage for averaging behavior, cache-index compaction semantics, CLI smoke paths for new commands, and magres emission in pipeline runs.
+- Polished integration docs for Snakemake and AiiDA, including average workflow examples.
+
 ## [0.2.0] - 2026-03-03
 - Hardened cache/index scanning with streaming JSONL parsing, deterministic duplicate-key precedence, malformed trailing-line tolerance, and stale lookup-cache invalidation after writes.
 - Improved cache hit materialization so cached predictions are remapped to current frame metadata, including duplicate-key input handling.

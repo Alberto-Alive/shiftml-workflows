@@ -8,6 +8,7 @@ Expected retrieved outputs:
 - `results.csv` or `results.parquet`
 - `run.json`
 - optional `predictions.magres` or `magres/*.magres`
+- optional averaged table from `shiftmlwf average`
 
 Implementation sketch:
 1. Stage input structures in working directory.

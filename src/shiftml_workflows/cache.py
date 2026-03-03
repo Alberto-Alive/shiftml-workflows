@@ -50,6 +50,9 @@ class _IndexRecord:
     cache_key: str
     chunk_path: str
     output_format: str
+    model_name: str | None
+    model_version: str | None
+    schema_version: str | None
     writer_id: str
     seq: int
     written_at_utc: str
@@ -66,6 +69,129 @@ class _IndexRecord:
             self.source_line_no,
             self.source_index_path,
         )
+
+    def to_index_payload(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "cache_key": self.cache_key,
+            "chunk_path": self.chunk_path,
+            "output_format": self.output_format,
+            "seq": self.seq,
+            "writer_id": self.writer_id,
+            "written_at_utc": self.written_at_utc,
+        }
+        if self.model_name is not None:
+            payload["model_name"] = self.model_name
+        if self.model_version is not None:
+            payload["model_version"] = self.model_version
+        if self.schema_version is not None:
+            payload["schema_version"] = self.schema_version
+        return payload
+
+
+def _parse_index_record(payload: object, *, source_index_path: str, source_line_no: int) -> _IndexRecord | None:
+    if not isinstance(payload, dict):
+        return None
+    try:
+        cache_key = str(payload["cache_key"])
+        chunk_path = str(payload["chunk_path"])
+        output_format = str(payload["output_format"])
+        writer_id = str(payload["writer_id"])
+        seq = int(payload["seq"])
+        written_at_utc = str(payload["written_at_utc"])
+        written_at = parse_rfc3339_utc(written_at_utc)
+    except Exception:
+        return None
+
+    model_name = payload.get("model_name")
+    model_version = payload.get("model_version")
+    schema_version = payload.get("schema_version")
+    return _IndexRecord(
+        cache_key=cache_key,
+        chunk_path=chunk_path,
+        output_format=output_format,
+        model_name=str(model_name) if model_name is not None else None,
+        model_version=str(model_version) if model_version is not None else None,
+        schema_version=str(schema_version) if schema_version is not None else None,
+        writer_id=writer_id,
+        seq=seq,
+        written_at_utc=written_at_utc,
+        written_at=written_at,
+        source_index_path=source_index_path,
+        source_line_no=source_line_no,
+    )
+
+
+def iter_index_records(index_path: Path) -> Iterator[_IndexRecord]:
+    try:
+        with index_path.open("r", encoding="utf-8") as fh:
+            for line_no, raw in enumerate(fh, start=1):
+                if not raw.strip():
+                    continue
+                try:
+                    payload = json.loads(raw)
+                except json.JSONDecodeError:
+                    # Tolerate partially-written trailing lines.
+                    continue
+                record = _parse_index_record(payload, source_index_path=str(index_path), source_line_no=line_no)
+                if record is not None:
+                    yield record
+    except OSError:
+        return
+
+
+def compact_index_files(
+    *,
+    cache_dir: Path,
+    remove_source_indexes: bool = False,
+) -> dict[str, object]:
+    """Compact index JSONL files by keeping only the latest record per cache key and output format."""
+
+    index_dir = cache_dir / "index"
+    index_dir.mkdir(parents=True, exist_ok=True)
+    source_index_paths = sorted(index_dir.glob("index_*.jsonl"))
+
+    compacted: dict[tuple[str, str], _IndexRecord] = {}
+    scanned_records = 0
+    for index_path in source_index_paths:
+        for record in iter_index_records(index_path):
+            scanned_records += 1
+            compaction_key = (record.cache_key, record.output_format)
+            existing = compacted.get(compaction_key)
+            if existing is None or record.rank > existing.rank:
+                compacted[compaction_key] = record
+
+    stamp = utc_now_rfc3339().replace(":", "").replace("-", "")
+    compact_path = index_dir / f"index_compacted_{stamp}_{secrets.token_hex(2)}.jsonl"
+    tmp_path = compact_path.with_suffix(compact_path.suffix + f".tmp-{os.getpid()}")
+    with tmp_path.open("w", encoding="utf-8") as fh:
+        ordered_records = sorted(
+            compacted.values(),
+            key=lambda rec: (rec.cache_key, rec.output_format, rec.rank),
+        )
+        for record in ordered_records:
+            fh.write(json.dumps(record.to_index_payload(), sort_keys=True, separators=(",", ":")) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp_path, compact_path)
+
+    removed_count = 0
+    if remove_source_indexes:
+        for index_path in source_index_paths:
+            try:
+                index_path.unlink()
+                removed_count += 1
+            except OSError:
+                continue
+
+    return {
+        "cache_dir": str(cache_dir),
+        "index_dir": str(index_dir),
+        "source_index_files": [str(path) for path in source_index_paths],
+        "compacted_index_file": str(compact_path),
+        "scanned_records": scanned_records,
+        "kept_records": len(compacted),
+        "removed_source_index_files": removed_count,
+    }
 
 
 class CacheStore:
@@ -115,41 +241,7 @@ class CacheStore:
             os.fsync(fh.fileno())
 
     def _iter_index_records(self, index_path: Path) -> Iterator[_IndexRecord]:
-        try:
-            with index_path.open("r", encoding="utf-8") as fh:
-                for line_no, raw in enumerate(fh, start=1):
-                    if not raw.strip():
-                        continue
-                    try:
-                        payload = json.loads(raw)
-                    except json.JSONDecodeError:
-                        # Tolerate partially-written trailing lines.
-                        continue
-
-                    try:
-                        cache_key = str(payload["cache_key"])
-                        chunk_path = str(payload["chunk_path"])
-                        output_format = str(payload["output_format"])
-                        writer_id = str(payload["writer_id"])
-                        seq = int(payload["seq"])
-                        written_at_utc = str(payload["written_at_utc"])
-                        written_at = parse_rfc3339_utc(written_at_utc)
-                    except Exception:
-                        continue
-
-                    yield _IndexRecord(
-                        cache_key=cache_key,
-                        chunk_path=chunk_path,
-                        output_format=output_format,
-                        writer_id=writer_id,
-                        seq=seq,
-                        written_at_utc=written_at_utc,
-                        written_at=written_at,
-                        source_index_path=str(index_path),
-                        source_line_no=line_no,
-                    )
-        except OSError:
-            return
+        yield from iter_index_records(index_path)
 
     def _prefer_record(self, record: _IndexRecord, existing: _IndexRecord) -> bool:
         record_pref = record.output_format == self.output_format

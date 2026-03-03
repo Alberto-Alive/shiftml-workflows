@@ -6,10 +6,14 @@ from pathlib import Path
 
 import json
 
+import pandas as pd
 import typer
 
 from shiftml_workflows import __version__
+from shiftml_workflows.averaging import average_per_atom, load_weights
+from shiftml_workflows.cache import compact_index_files
 from shiftml_workflows.config import ConfigError, build_predict_config
+from shiftml_workflows.io import atomic_write_dataframe
 from shiftml_workflows.pipeline import (
     BackendRuntimeError,
     MissingDependencyError,
@@ -24,6 +28,46 @@ app = typer.Typer(help="Workflow-friendly ShiftML3 predictions")
 
 def _print_json(payload: dict[str, object]) -> None:
     typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def _read_results_table(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        raise ConfigError(f"Results file does not exist: {path}")
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        return pd.read_csv(path)
+    if suffix == ".parquet":
+        try:
+            return pd.read_parquet(path)
+        except ImportError as exc:
+            raise MissingDependencyError("Reading parquet results requires pyarrow") from exc
+    raise ConfigError("Results input must be .csv or .parquet")
+
+
+def _resolve_average_output(path: Path, requested_format: str) -> tuple[Path, str]:
+    normalized = requested_format.strip().lower()
+    if normalized not in {"auto", "csv", "parquet"}:
+        raise ConfigError("--format must be one of auto|csv|parquet")
+
+    if normalized == "auto":
+        if path.suffix.lower() in {".csv", ".parquet"}:
+            target_format = path.suffix.lower().lstrip(".")
+        else:
+            target_format = "csv"
+    else:
+        target_format = normalized
+
+    if target_format == "parquet":
+        try:
+            import pyarrow  # noqa: F401
+        except ImportError as exc:
+            raise MissingDependencyError("Parquet output requested but pyarrow is not installed") from exc
+
+    if path.suffix.lower() not in {".csv", ".parquet"}:
+        out_path = path.with_suffix(f".{target_format}")
+    else:
+        out_path = path
+    return out_path, target_format
 
 
 @app.command()
@@ -134,6 +178,65 @@ def predict(
         typer.echo(f"Backend runtime error: {exc}", err=True)
         raise typer.Exit(code=5)
     except PipelineError as exc:
+        typer.echo(f"Pipeline error: {exc}", err=True)
+        raise typer.Exit(code=1)
+
+
+@app.command("average")
+def average(
+    results: Path = typer.Argument(..., help="Input results CSV/Parquet from shiftmlwf predict"),
+    out: Path = typer.Option(..., "--out", help="Output averaged table path"),
+    weights: Path | None = typer.Option(None, "--weights", help="Optional JSON/YAML weights mapping source#frame to weight"),
+    output_format: str = typer.Option("auto", "--format", help="auto|csv|parquet"),
+) -> None:
+    """Average per-atom prediction columns across frames."""
+    try:
+        input_df = _read_results_table(results)
+        weight_map = load_weights(weights) if weights is not None else None
+        averaged_df = average_per_atom(input_df, weights=weight_map)
+        out_path, resolved_format = _resolve_average_output(out, output_format)
+        atomic_write_dataframe(out_path, averaged_df, resolved_format)
+        _print_json(
+            {
+                "status": "ok",
+                "input": str(results),
+                "output": str(out_path),
+                "format": resolved_format,
+                "rows": int(len(averaged_df)),
+                "weights_applied": bool(weight_map),
+            }
+        )
+    except ConfigError as exc:
+        typer.echo(f"Configuration error: {exc}", err=True)
+        raise typer.Exit(code=2)
+    except MissingDependencyError as exc:
+        typer.echo(f"Missing dependency: {exc}", err=True)
+        raise typer.Exit(code=4)
+    except ValueError as exc:
+        typer.echo(f"Validation error: {exc}", err=True)
+        raise typer.Exit(code=3)
+    except Exception as exc:
+        typer.echo(f"Pipeline error: {exc}", err=True)
+        raise typer.Exit(code=1)
+
+
+@app.command("cache-compact")
+def cache_compact(
+    cache_dir: Path = typer.Argument(..., help="Cache directory containing index/"),
+    remove_source_indexes: bool = typer.Option(
+        False,
+        "--remove-source-indexes",
+        help="Remove existing index_*.jsonl files after writing compacted index",
+    ),
+) -> None:
+    """Compact cache index logs while preserving deterministic duplicate-key precedence."""
+    try:
+        summary = compact_index_files(
+            cache_dir=cache_dir,
+            remove_source_indexes=remove_source_indexes,
+        )
+        _print_json({"status": "ok", **summary})
+    except Exception as exc:
         typer.echo(f"Pipeline error: {exc}", err=True)
         raise typer.Exit(code=1)
 

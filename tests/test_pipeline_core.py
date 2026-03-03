@@ -273,3 +273,29 @@ def test_cache_store_ignores_malformed_trailing_line(tmp_path: Path) -> None:
 
     hit_df = store.lookup_many(["k1", "k2"])
     assert sorted(hit_df["frame_cache_key"].unique().tolist()) == ["k1", "k2"]
+
+
+def test_pipeline_writes_magres_outputs(tmp_path: Path) -> None:
+    in_path = tmp_path / "sample.extxyz"
+    write(in_path, [_cell_frame()])
+
+    cfg = PredictConfig(
+        outdir=tmp_path / "out",
+        output_format="csv",
+        magres_mode="per-frame",
+    )
+    run_predict(inputs=[str(in_path)], config=cfg, backend_factory=lambda _device: DummyBackend())
+
+    per_frame_files = sorted((cfg.outdir / "magres").glob("*.magres"))
+    assert len(per_frame_files) == 1
+    assert "[magres]" in per_frame_files[0].read_text(encoding="utf-8")
+
+    cfg_single = PredictConfig(
+        outdir=tmp_path / "out_single",
+        output_format="csv",
+        magres_mode="single",
+    )
+    run_predict(inputs=[str(in_path)], config=cfg_single, backend_factory=lambda _device: DummyBackend())
+    single_file = cfg_single.outdir / "predictions.magres"
+    assert single_file.exists()
+    assert single_file.read_text(encoding="utf-8").count("#$magres-abinitio-v1.0") == 1

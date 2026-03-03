@@ -42,6 +42,18 @@ shiftmlwf predict "data/*.extxyz" \
   --format auto
 ```
 
+### Post-processing average
+
+```bash
+shiftmlwf average out/hpc/results.csv --out out/hpc/avg.csv
+```
+
+### Cache index compaction
+
+```bash
+shiftmlwf cache-compact /scratch/$USER/shiftml-cache
+```
+
 ## Outputs
 
 - `results.csv` or `results.parquet`
@@ -78,6 +90,20 @@ Cache index uses per-writer JSONL files:
 
 Cache lookups remap cached predictions onto the current frame metadata (`source_file`, `frame`, coordinates), so reused keys remain correct across files/runs.
 
+For long-lived caches with many writer logs, compact index files to speed startup scans:
+- `shiftmlwf cache-compact <cache_dir>`
+- add `--remove-source-indexes` to delete old `index_*.jsonl` logs after successful compaction
+
+Compaction keeps the latest entry per `(cache_key, output_format)` using the same deterministic precedence as lookup.
+
+## Averaging
+
+`shiftmlwf average` computes per-atom weighted or unweighted averages across frames.
+
+- input: `results.csv` or `results.parquet`
+- output: CSV or parquet (`--format auto|csv|parquet`)
+- optional weights file: JSON/YAML mapping `"<source_file>#<frame>" -> weight`
+
 ## Committee uncertainty
 
 If `--committee` is set and `--property` is omitted, property resolves to `iso`.
@@ -97,6 +123,11 @@ If you explicitly set `--property tensor|both`, it is honored.
 - `--device cpu|cuda` is used as requested.
 - `device=cuda` with `workers>1` is coerced to `workers=1` unless `--force-multi-gpu` is set.
 - `run.json` runtime metadata records the resolved runtime device and worker count.
+
+## Workflow integrations
+
+- Snakemake wrapper and environment: `integrations/snakemake/`
+- AiiDA notes and CalcJob skeleton: `integrations/aiida/`
 
 ## Limitations
 
