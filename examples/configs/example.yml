@@ -1,0 +1,10 @@
+frames: ":"
+device: cpu
+workers: 2
+chunk_size: 200
+cache_chunk_max_mb: 100
+committee: false
+property_mode: iso
+output_format: auto
+magres_mode: none
+on_warning: warn

@@ -1,2 +1,93 @@
 # shiftml-workflows
-CLI and Python workflows for running ShiftML predictions, generating magres files, and analyzing NMR ensembles.
+
+CLI and Python workflows for running ShiftML3 predictions with deterministic outputs, cache support, and provenance.
+
+## Installation
+
+### Editable install
+
+```bash
+pip install -e .
+```
+
+### From git
+
+```bash
+pip install "git+https://github.com/your-org/shiftml-workflows.git"
+```
+
+### Optional extras
+
+```bash
+pip install -e ".[parquet,yaml,pretty,spectra]"
+```
+
+## CLI quickstart
+
+### Laptop CPU run
+
+```bash
+shiftmlwf predict examples/minimal.xyz --out out/cpu --device cpu
+```
+
+### HPC-style run with cache
+
+```bash
+shiftmlwf predict "data/*.extxyz" \
+  --out out/hpc \
+  --workers 8 \
+  --chunk-size 200 \
+  --cache-chunk-max-mb 100 \
+  --cache-dir /scratch/$USER/shiftml-cache \
+  --format auto
+```
+
+## Outputs
+
+- `results.csv` or `results.parquet`
+- optional magres files (`--magres per-frame|single`)
+- `run.json` with provenance, warnings, timings, and runtime metadata
+
+### Stable schema columns
+
+Always present:
+- `structure_id`, `source_file`, `frame`, `atom_i`, `element`, `x`, `y`, `z`, `cs_iso`
+
+Optional:
+- `cs_iso_uncertainty` when committee mode is enabled
+- tensor columns when `--property tensor|both`
+
+Row order is deterministic and sorted by `(source_file, frame, atom_i)`.
+
+## Caching
+
+Cache keys are per frame and depend on:
+- model name/version
+- schema version
+- prediction flags
+- normalized structure hash
+
+Cache storage is chunked to avoid many tiny files:
+- frame-count threshold: `--chunk-size`
+- size threshold: `--cache-chunk-max-mb` (must be `> 0`; recommend `50-200` MB)
+
+Cache index uses per-writer JSONL files:
+- `index_<hostname>-<pid>-<run_suffix>.jsonl`
+- malformed trailing lines are ignored safely
+
+## Committee uncertainty
+
+If `--committee` is set and `--property` is omitted, property resolves to `iso`.
+If you explicitly set `--property tensor|both`, it is honored.
+
+## Limitations
+
+- Supported element list is conservative and validated before prediction.
+- Missing cell/PBC is normalized to `zeros` + `pbc=(0,0,0)` and recorded in provenance.
+- Tensor output availability depends on backend capabilities.
+- Ensemble averaging assumes consistent atom indexing when averaging across frames.
+
+## Reproducibility and locking
+
+Dependency ranges are bounded in `pyproject.toml`.
+For fully pinned environments, use your own lock workflow (`uv`, `pip-tools`, or Poetry) in downstream projects.

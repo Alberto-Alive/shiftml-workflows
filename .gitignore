@@ -1,2 +1,21 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+.venv/
+.env
+build/
+dist/
+.cache/
+.mypy_cache/
+
+# Workflow outputs
+out/
+*.parquet
+*.csv
+*.magres
+
+# Local planning docs
 MasterPlan.md
 StagedPlan.md
