@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import threading
+import time
 
 import numpy as np
 import pandas as pd
@@ -205,6 +207,102 @@ def test_auto_cuda_respects_force_multi_gpu(monkeypatch: pytest.MonkeyPatch, tmp
     assert not any("coerced to workers=1" in warning for warning in summary.warnings)
 
 
+def test_cpu_multiworker_chunking_uses_worker_local_backends(tmp_path: Path) -> None:
+    in_path = tmp_path / "sample.extxyz"
+    frames = [
+        Atoms("H", positions=[[float(i), 0.0, 0.0]], cell=[8, 8, 8], pbc=True)
+        for i in range(6)
+    ]
+    write(in_path, frames)
+
+    lock = threading.Lock()
+    created_backend_ids: list[int] = []
+    used_backend_ids: list[int] = []
+    backend_counter = {"value": 0}
+
+    class TrackingBackend:
+        name = "tracking"
+
+        def __init__(self, backend_id: int) -> None:
+            self._backend_id = backend_id
+
+        def predict(self, frames, *, device="auto", committee=False, property="iso"):
+            time.sleep(0.02)
+            with lock:
+                used_backend_ids.append(self._backend_id)
+            predictions = []
+            for atoms in frames:
+                iso = np.array([float(atoms.positions[0, 0])], dtype=np.float64)
+                predictions.append(FramePrediction(cs_iso=iso))
+            return PredictionResult(frames=predictions)
+
+    def backend_factory(_device: str) -> TrackingBackend:
+        with lock:
+            backend_counter["value"] += 1
+            backend_id = backend_counter["value"]
+            created_backend_ids.append(backend_id)
+        return TrackingBackend(backend_id)
+
+    cfg = PredictConfig(
+        outdir=tmp_path / "out",
+        output_format="csv",
+        device="cpu",
+        workers=2,
+        chunk_size=1,
+    )
+    summary = run_predict(inputs=[str(in_path)], config=cfg, backend_factory=backend_factory)
+
+    assert summary.device == "cpu"
+    assert summary.workers == 2
+    assert len(set(created_backend_ids)) == 2
+    assert len(set(used_backend_ids)) == 2
+
+    df = pd.read_csv(summary.output_path)
+    assert df["frame"].tolist() == [0, 1, 2, 3, 4, 5]
+    assert df["cs_iso"].tolist() == [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+
+
+def test_cpu_multiworker_output_deterministic_across_runs(tmp_path: Path) -> None:
+    in_path = tmp_path / "sample.extxyz"
+    frames = [
+        Atoms("HC", positions=[[float(i), 0.0, 0.0], [0.0, float(i), 0.0]], cell=[9, 9, 9], pbc=True)
+        for i in range(4)
+    ]
+    write(in_path, frames)
+
+    class DeterministicBackend:
+        name = "deterministic"
+
+        def predict(self, frames, *, device="auto", committee=False, property="iso"):
+            predictions = []
+            for atoms in frames:
+                base = float(atoms.positions[0, 0])
+                iso = np.array([base + 0.1, base + 0.2], dtype=np.float64)
+                predictions.append(FramePrediction(cs_iso=iso))
+            return PredictionResult(frames=predictions)
+
+    cfg_a = PredictConfig(
+        outdir=tmp_path / "out_a",
+        output_format="csv",
+        device="cpu",
+        workers=2,
+        chunk_size=1,
+    )
+    cfg_b = PredictConfig(
+        outdir=tmp_path / "out_b",
+        output_format="csv",
+        device="cpu",
+        workers=2,
+        chunk_size=1,
+    )
+    run_predict(inputs=[str(in_path)], config=cfg_a, backend_factory=lambda _device: DeterministicBackend())
+    run_predict(inputs=[str(in_path)], config=cfg_b, backend_factory=lambda _device: DeterministicBackend())
+
+    df_a = pd.read_csv(cfg_a.outdir / "results.csv")
+    df_b = pd.read_csv(cfg_b.outdir / "results.csv")
+    pd.testing.assert_frame_equal(df_a, df_b)
+
+
 def test_run_json_written_on_backend_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(pipeline, "_cuda_available", lambda: False)
     in_path = tmp_path / "sample.extxyz"
@@ -299,3 +397,34 @@ def test_pipeline_writes_magres_outputs(tmp_path: Path) -> None:
     single_file = cfg_single.outdir / "predictions.magres"
     assert single_file.exists()
     assert single_file.read_text(encoding="utf-8").count("#$magres-abinitio-v1.0") == 1
+
+
+def test_pipeline_writes_magres_with_cell_and_pbc_metadata(tmp_path: Path) -> None:
+    in_path = tmp_path / "sample.extxyz"
+    frame = Atoms(
+        "HCO",
+        positions=[[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]],
+        cell=[[8.0, 0.0, 0.0], [0.0, 9.0, 0.0], [0.0, 0.0, 10.0]],
+        pbc=[True, False, True],
+    )
+    write(in_path, [frame])
+
+    cfg = PredictConfig(
+        outdir=tmp_path / "out",
+        output_format="csv",
+        magres_mode="per-frame",
+    )
+    run_predict(inputs=[str(in_path)], config=cfg, backend_factory=lambda _device: DummyBackend())
+
+    per_frame_files = sorted((cfg.outdir / "magres").glob("*.magres"))
+    assert len(per_frame_files) == 1
+    text = per_frame_files[0].read_text(encoding="utf-8")
+    assert "units lattice Angstrom" in text
+    assert "lattice 8.00000000 0.00000000 0.00000000 0.00000000 9.00000000 0.00000000 0.00000000 0.00000000 10.00000000" in text
+    assert "# pbc 1 0 1" in text
+
+    first_ms_line = next(line for line in text.splitlines() if line.startswith("ms "))
+    values = [float(value) for value in first_ms_line.split()[3:]]
+    assert values[0] == pytest.approx(1.0)
+    assert values[4] == pytest.approx(1.0)
+    assert values[8] == pytest.approx(1.0)

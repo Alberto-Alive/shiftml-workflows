@@ -6,7 +6,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import importlib.metadata
+import threading
 import time
 
 import numpy as np
@@ -17,6 +19,7 @@ from shiftml_workflows.cache import CacheStore, compute_cache_key
 from shiftml_workflows.config import PredictConfig
 from shiftml_workflows.io import AtomsFrame, InputError, atomic_write_dataframe, count_atoms, load_structures, resolve_inputs
 from shiftml_workflows.magres import write_magres
+from shiftml_workflows.parallel import chunked
 from shiftml_workflows.provenance import Timing, build_run_record, write_run_record
 from shiftml_workflows.schema import SCHEMA_VERSION, required_columns, to_dataframe
 
@@ -245,6 +248,87 @@ def _prepare_rows_for_cache_store(df: pd.DataFrame) -> pd.DataFrame:
     return pd.concat(parts, ignore_index=True)
 
 
+def _predict_miss_frames_dataframe(
+    *,
+    miss_frames: list[AtomsFrame],
+    miss_keys: list[str],
+    runtime_device: str,
+    workers: int,
+    chunk_size: int,
+    committee: bool,
+    property_mode: str,
+    backend_factory: Callable[[str], Backend],
+) -> pd.DataFrame:
+    if not miss_frames:
+        return pd.DataFrame()
+
+    if runtime_device == "cpu" and workers > 1:
+        chunk_pairs = list(chunked(list(zip(miss_frames, miss_keys)), chunk_size))
+        if not chunk_pairs:
+            return pd.DataFrame()
+
+        thread_state = threading.local()
+
+        def predict_chunk(
+            chunk_index: int,
+            pairs: list[tuple[AtomsFrame, str]],
+        ) -> tuple[int, pd.DataFrame]:
+            backend = getattr(thread_state, "backend", None)
+            if backend is None:
+                backend = backend_factory(runtime_device)
+                thread_state.backend = backend
+
+            frames = [frame for frame, _ in pairs]
+            keys = [key for _, key in pairs]
+            prediction = backend.predict(
+                [frame.atoms for frame in frames],
+                device=runtime_device,
+                committee=committee,
+                property=property_mode,
+            )
+            return (
+                chunk_index,
+                to_dataframe(
+                    frames,
+                    prediction,
+                    property_mode=property_mode,
+                    committee=committee,
+                    frame_cache_keys=keys,
+                ),
+            )
+
+        ordered_parts: list[pd.DataFrame | None] = [None] * len(chunk_pairs)
+        max_workers = min(workers, len(chunk_pairs))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(predict_chunk, chunk_index, pairs): chunk_index
+                for chunk_index, pairs in enumerate(chunk_pairs)
+            }
+            for future in as_completed(futures):
+                chunk_index, chunk_df = future.result()
+                ordered_parts[chunk_index] = chunk_df
+
+        parts = [part for part in ordered_parts if part is not None and not part.empty]
+        if not parts:
+            return pd.DataFrame()
+        return pd.concat(parts, ignore_index=True)
+
+    backend = backend_factory(runtime_device)
+    prediction = backend.predict(
+        [frame.atoms for frame in miss_frames],
+        device=runtime_device,
+        committee=committee,
+        property=property_mode,
+    )
+    return to_dataframe(
+        miss_frames,
+        prediction,
+        property_mode=property_mode,
+        committee=committee,
+        frame_cache_keys=miss_keys,
+    )
+
+
 def run_predict(
     *,
     inputs: list[str],
@@ -351,25 +435,21 @@ def run_predict(
             miss_keys = [key for _, key in miss_pairs]
 
             try:
-                backend = backend_factory(runtime_device)
-                prediction = backend.predict(
-                    [frame.atoms for frame in miss_frames],
-                    device=runtime_device,
+                predicted_df = _predict_miss_frames_dataframe(
+                    miss_frames=miss_frames,
+                    miss_keys=miss_keys,
+                    runtime_device=runtime_device,
+                    workers=workers,
+                    chunk_size=config.chunk_size,
                     committee=config.committee,
-                    property=property_mode,
+                    property_mode=property_mode,
+                    backend_factory=backend_factory,
                 )
             except ValidationError:
                 raise
             except Exception as exc:
                 raise BackendRuntimeError(f"Backend prediction failed: {exc}") from exc
 
-            predicted_df = to_dataframe(
-                miss_frames,
-                prediction,
-                property_mode=property_mode,
-                committee=config.committee,
-                frame_cache_keys=miss_keys,
-            )
             if cache_store is not None and not predicted_df.empty:
                 cacheable_df = _prepare_rows_for_cache_store(predicted_df)
                 cache_store.store_dataframe(
@@ -398,7 +478,7 @@ def run_predict(
         atomic_write_dataframe(output_path, frames_df, output_format)
 
         if config.magres_mode != "none":
-            write_magres(frames_df, config.outdir, config.magres_mode)
+            write_magres(frames_df, config.outdir, config.magres_mode, frames=frames)
 
         summary = RunSummary(
             outdir=config.outdir,
