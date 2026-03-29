@@ -1,5 +1,7 @@
 # Changelog
 
+## [0.5.0] - Unreleased
+
 ## [0.4.0] - 2026-03-04
 - Implemented CPU multi-worker prediction execution via frame chunking and worker-local backend instances.
 - Preserved deterministic final output row ordering by `(source_file, frame, atom_i)` for multi-worker runs.
