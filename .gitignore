@@ -19,3 +19,4 @@ out/
 # Local planning docs
 MasterPlan.md
 StagedPlan.md
+.temp/
